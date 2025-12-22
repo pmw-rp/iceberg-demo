@@ -24,6 +24,6 @@ spec:
             - name: QUARKUS_DATASOURCE_PASSWORD
               value: "polaris123"
             - name: QUARKUS_DATASOURCE_JDBC_URL
-              value: "jdbc:postgresql://local-postgresql.${POSTGRES_NAMESPACE}.svc.cluster.local:5432/polaris?currentSchema"
+              value: "jdbc:postgresql://postgres.${POSTGRES_NAMESPACE}.svc.cluster.local:5432/polaris?currentSchema"
       restartPolicy: Never
   backoffLimit: 2

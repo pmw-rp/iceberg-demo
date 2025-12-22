@@ -1,3 +1,8 @@
+authentication:
+  type: mixed
+  activeRolesProvider:
+    type: internal
+
 persistence:
   type: relational-jdbc
   relationalJdbc:

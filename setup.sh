@@ -6,9 +6,16 @@ source ./config
 # Install Minio
 
 kubectl create namespace $MINIO_NAMESPACE
-cat << EOF | helm install -n $MINIO_NAMESPACE local oci://registry-1.docker.io/bitnamicharts/minio --wait -f -
+cat << EOF | helm upgrade --install -n $MINIO_NAMESPACE local oci://registry-1.docker.io/bitnamicharts/minio --wait -f -
+global:
+  security:
+    allowInsecureImages: true
 image:
+  repository: bitnamilegacy/minio
   debug: true
+console:
+  image:
+    repository: bitnamilegacy/minio-object-browser
 extraEnvVars:
   - name: MINIO_LOG_LEVEL
     value: DEBUG
@@ -36,10 +43,10 @@ export MINIO_ENDPOINT=local-minio.$MINIO_NAMESPACE.svc.cluster.local:9000
 
 kubectl create namespace $POSTGRES_NAMESPACE
 
-helm install -n $POSTGRES_NAMESPACE local oci://registry-1.docker.io/bitnamicharts/postgresql --wait
+kubectl apply -f resources/postgres.yaml -n ${POSTGRES_NAMESPACE}
 sleep 5
-export POSTGRES_PASSWORD=$(kubectl get secret --namespace $POSTGRES_NAMESPACE local-postgresql -o jsonpath="{.data.postgres-password}" | base64 -d)
-cat resources/create-db.sql | kubectl exec -it local-postgresql-0 -n $POSTGRES_NAMESPACE -- /opt/bitnami/scripts/postgresql/entrypoint.sh /bin/bash -c "psql postgresql://postgres:${POSTGRES_PASSWORD}@local-postgresql/postgres"
+export POSTGRES_PASSWORD=postgres123
+cat resources/create-db.sql | kubectl exec -it postgres-0 -n $POSTGRES_NAMESPACE -- /bin/bash -c "psql postgresql://postgres:${POSTGRES_PASSWORD}@postgres-0/postgres"
 
 # Install Polaris
 
@@ -56,7 +63,7 @@ kubectl create secret generic aws-creds -n $POLARIS_NAMESPACE --from-file=creden
 cat << EOF > postgres-creds
 username=polaris
 password=polaris123
-url=jdbc:postgresql://local-postgresql.$POSTGRES_NAMESPACE.svc.cluster.local:5432/polaris?currentSchema=polaris
+url=jdbc:postgresql://postgres.$POSTGRES_NAMESPACE.svc.cluster.local:5432/polaris?currentSchema=polaris
 EOF
 kubectl create secret generic postgres-creds --from-env-file="$PWD/postgres-creds" -n $POLARIS_NAMESPACE
 
