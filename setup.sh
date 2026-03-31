@@ -1,11 +1,21 @@
+set -euo pipefail
+
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 pushd $SCRIPT_DIR
 
 source ./config
 
+# Cleanup temp credential files and background port-forwards on exit
+POLARIS_PF_PID=""
+cleanup() {
+  rm -f aws-creds minio-creds postgres-creds
+  [ -n "$POLARIS_PF_PID" ] && kill "$POLARIS_PF_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
 # Install Minio
 
-kubectl create namespace $MINIO_NAMESPACE
+kubectl create namespace $MINIO_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
 cat << EOF | helm upgrade --install -n $MINIO_NAMESPACE local oci://registry-1.docker.io/bitnamicharts/minio --wait -f -
 global:
   security:
@@ -31,7 +41,7 @@ access=${MINIO_USER}
 secret=${MINIO_PASSWORD}
 EOF
 
-export MINIO_POD=$(kubectl get pods -n $MINIO_NAMESPACE | egrep -v 'console|NAME' | awk '{print $1}')
+export MINIO_POD=$(kubectl get pods -n $MINIO_NAMESPACE | grep -Ev 'console|NAME' | awk '{print $1}')
 
 kubectl exec -n ${MINIO_NAMESPACE} ${MINIO_POD} -- mc alias set local http://local-minio.$MINIO_NAMESPACE.svc.cluster.local:9000 ${MINIO_USER} ${MINIO_PASSWORD}
 kubectl exec -n ${MINIO_NAMESPACE} ${MINIO_POD} -- mc mb local/redpanda
@@ -41,16 +51,21 @@ export MINIO_ENDPOINT=local-minio.$MINIO_NAMESPACE.svc.cluster.local:9000
 
 # Install Postgres
 
-kubectl create namespace $POSTGRES_NAMESPACE
+kubectl create namespace $POSTGRES_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl apply -f resources/postgres.yaml -n ${POSTGRES_NAMESPACE}
-sleep 5
+kubectl wait --for=condition=ready pod -l app=postgres -n $POSTGRES_NAMESPACE --timeout=120s
+for i in $(seq 1 30); do
+  kubectl exec -n $POSTGRES_NAMESPACE postgres-0 -- pg_isready -U postgres && break
+  [ $i -eq 30 ] && { echo "Timed out waiting for postgres to accept connections"; exit 1; }
+  sleep 2
+done
 export POSTGRES_PASSWORD=postgres123
 cat resources/create-db.sql | kubectl exec -it postgres-0 -n $POSTGRES_NAMESPACE -- /bin/bash -c "psql postgresql://postgres:${POSTGRES_PASSWORD}@postgres-0/postgres"
 
 # Install Polaris
 
-kubectl create namespace $POLARIS_NAMESPACE
+kubectl create namespace $POLARIS_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
 
 cat << EOF > aws-creds
 [minio]
@@ -58,14 +73,14 @@ aws_access_key_id=${MINIO_USER}
 aws_secret_access_key=${MINIO_PASSWORD}
 region=dummy
 EOF
-kubectl create secret generic aws-creds -n $POLARIS_NAMESPACE --from-file=credentials=aws-creds
+kubectl create secret generic aws-creds -n $POLARIS_NAMESPACE --from-file=credentials=aws-creds --dry-run=client -o yaml | kubectl apply -f -
 
 cat << EOF > postgres-creds
 username=polaris
 password=polaris123
 url=jdbc:postgresql://postgres.$POSTGRES_NAMESPACE.svc.cluster.local:5432/polaris?currentSchema=polaris
 EOF
-kubectl create secret generic postgres-creds --from-env-file="$PWD/postgres-creds" -n $POLARIS_NAMESPACE
+kubectl create secret generic postgres-creds --from-env-file="$PWD/postgres-creds" -n $POLARIS_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
 
 helm upgrade --install --namespace $POLARIS_NAMESPACE polaris resources/polaris/helm/polaris -f resources/polaris-values.yaml --wait
 
@@ -73,14 +88,22 @@ helm upgrade --install --namespace $POLARIS_NAMESPACE polaris resources/polaris/
 
 envsubst < resources/bootstrap.yaml | kubectl apply -f -
 kubectl wait --for=condition=complete job/bootstrap -n $POLARIS_NAMESPACE
-sleep 5
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=polaris -n $POLARIS_NAMESPACE --timeout=120s
 
 # Create the Redpanda catalog and associated RBAC
 
 kubectl port-forward svc/polaris -n $POLARIS_NAMESPACE 8181:8181 &
-sleep 5
+POLARIS_PF_PID=$!
 
-#export POLARIS_HOST=polaris.$POLARIS_NAMESPACE.svc.cluster.local
+# Wait for port-forward to be ready
+for i in $(seq 1 20); do
+  curl -sf http://localhost:8181/api/catalog/v1/oauth/tokens --user root:pass \
+    -H "Polaris-Realm: POLARIS" -d grant_type=client_credentials \
+    -d scope=PRINCIPAL_ROLE:ALL -o /dev/null && break
+  [ $i -eq 20 ] && { echo "Timed out waiting for Polaris port-forward"; exit 1; }
+  sleep 1
+done
+
 export POLARIS_HOST=localhost
 export POLARIS_ENDPOINT=http://$POLARIS_HOST:8181/api/catalog
 
@@ -91,35 +114,42 @@ export TOKEN=$(curl -s http://$POLARIS_HOST:8181/api/catalog/v1/oauth/tokens \
   -d grant_type=client_credentials \
   -d scope=PRINCIPAL_ROLE:ALL | jq -r .access_token)
 
+[ -z "$TOKEN" ] || [ "$TOKEN" = "null" ] && { echo "Failed to obtain Polaris token"; exit 1; }
+
 ## Create the catalog
-curl -v -X POST http://$POLARIS_HOST:8181/api/management/v1/catalogs \
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://$POLARIS_HOST:8181/api/management/v1/catalogs \
   -H "Polaris-Realm: POLARIS" \
   -H "Authorization: Bearer $TOKEN" \
-  --json '{"type":"INTERNAL","name":"redpanda_catalog","properties":{"default-base-location":"s3://redpanda"},"createTimestamp":1758705392193,"lastUpdateTimestamp":1758705392193,"entityVersion":1,"storageConfigInfo":{"roleArn":"arn:aws:iam::123456789012:role/dummy","region":"dummy","endpoint":"http://local-minio.minio.svc.cluster.local:9000/","pathStyleAccess":true,"storageType":"S3","allowedLocations":["s3://redpanda"]}}'
+  --json '{"type":"INTERNAL","name":"redpanda_catalog","properties":{"default-base-location":"s3://redpanda"},"createTimestamp":1758705392193,"lastUpdateTimestamp":1758705392193,"entityVersion":1,"storageConfigInfo":{"roleArn":"arn:aws:iam::123456789012:role/dummy","region":"dummy","endpoint":"http://local-minio.minio.svc.cluster.local:9000/","pathStyleAccess":true,"storageType":"S3","allowedLocations":["s3://redpanda"]}}')
+[[ "$HTTP_STATUS" =~ ^2 ]] || { echo "Failed to create catalog (HTTP $HTTP_STATUS)"; exit 1; }
 
 # List the current catalogs to validate that our creation was successful
 curl -s -X GET http://$POLARIS_HOST:8181/api/management/v1/catalogs \
   -H "Authorization: Bearer $TOKEN" | jq
 
 # Create a catalog admin role
-curl -s -X PUT http://$POLARIS_HOST:8181/api/management/v1/catalogs/redpanda_catalog/catalog-roles/catalog_admin/grants \
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PUT http://$POLARIS_HOST:8181/api/management/v1/catalogs/redpanda_catalog/catalog-roles/catalog_admin/grants \
   -H "Authorization: Bearer $TOKEN" \
-  --json '{"grant":{"type":"catalog", "privilege":"CATALOG_MANAGE_CONTENT"}}'
+  --json '{"grant":{"type":"catalog", "privilege":"CATALOG_MANAGE_CONTENT"}}')
+[[ "$HTTP_STATUS" =~ ^2 ]] || { echo "Failed to grant catalog admin role (HTTP $HTTP_STATUS)"; exit 1; }
 
 # Create a data engineer role
-curl -s -X POST http://$POLARIS_HOST:8181/api/management/v1/principal-roles \
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://$POLARIS_HOST:8181/api/management/v1/principal-roles \
   -H "Authorization: Bearer $TOKEN" \
-  --json '{"principalRole":{"name":"data_engineer"}}'
+  --json '{"principalRole":{"name":"data_engineer"}}')
+[[ "$HTTP_STATUS" =~ ^2 ]] || { echo "Failed to create data_engineer role (HTTP $HTTP_STATUS)"; exit 1; }
 
 # Connect the roles
-curl -s -X PUT http://$POLARIS_HOST:8181/api/management/v1/principal-roles/data_engineer/catalog-roles/redpanda_catalog \
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PUT http://$POLARIS_HOST:8181/api/management/v1/principal-roles/data_engineer/catalog-roles/redpanda_catalog \
   -H "Authorization: Bearer $TOKEN" \
-  --json '{"catalogRole":{"name":"catalog_admin"}}'
+  --json '{"catalogRole":{"name":"catalog_admin"}}')
+[[ "$HTTP_STATUS" =~ ^2 ]] || { echo "Failed to connect roles (HTTP $HTTP_STATUS)"; exit 1; }
 
 # Give root the data engineer role
-curl -s -X PUT http://$POLARIS_HOST:8181/api/management/v1/principals/root/principal-roles \
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PUT http://$POLARIS_HOST:8181/api/management/v1/principals/root/principal-roles \
   -H "Authorization: Bearer $TOKEN" \
-  --json '{"principalRole": {"name":"data_engineer"}}'
+  --json '{"principalRole": {"name":"data_engineer"}}')
+[[ "$HTTP_STATUS" =~ ^2 ]] || { echo "Failed to assign data_engineer role to root (HTTP $HTTP_STATUS)"; exit 1; }
 
 # Get the roles for root to show the RBAC configuration is sufficient
 curl -s -X GET http://$POLARIS_HOST:8181/api/management/v1/principals/root/principal-roles -H "Authorization: Bearer $TOKEN" | jq
@@ -137,7 +167,7 @@ cat << EOF | helm upgrade --install redpanda redpanda/redpanda \
   -f -
 image:
   repository: docker.redpanda.com/redpandadata/redpanda
-  tag: v25.2.2
+  tag: v25.3.9
 external:
   enabled: true
   service:
@@ -192,11 +222,13 @@ EOF
 
 kubectl port-forward pod/redpanda-0 -n $REDPANDA_NAMESPACE 8081 9094 9644 &
 echo $! > port-forward.pid
+kubectl port-forward svc/polaris -n $POLARIS_NAMESPACE 8181:8181 &
+echo $! > polaris-port-forward.pid
 rpk profile create local-bcced7fb -s brokers=localhost:9094 -s admin.hosts=localhost:9644 || rpk profile use local-bcced7fb
 
 # Create a Ubuntu pod to run DuckDB
 
-kubectl create namespace $DUCKDB_NAMESPACE
+kubectl create namespace $DUCKDB_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
 
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
@@ -212,18 +244,19 @@ spec:
     command:
       - sh
       - -c
-      - "apt update && apt install -y curl && curl https://install.duckdb.org | sh && sleep infinity"
+      - "apt update && apt install -y curl && curl https://install.duckdb.org | DUCKDB_VERSION=$DUCKDB_VERSION sh && sleep infinity"
     imagePullPolicy: IfNotPresent
     name: ubuntu
   restartPolicy: Always
 EOF
 
-# Configure the DuckDB init sql
-sleep 5
+kubectl wait --for=condition=ready pod/duckdb -n $DUCKDB_NAMESPACE --timeout=300s
 
 # Configure the DuckDB init sql
 export MINIO_ENDPOINT=local-minio.$MINIO_NAMESPACE.svc.cluster.local:9000
 export POLARIS_ENDPOINT=http://polaris.$POLARIS_NAMESPACE.svc.cluster.local:8181/api/catalog
+export MINIO_USER=$(kubectl get secret --namespace $MINIO_NAMESPACE local-minio -o jsonpath="{.data.root-user}" | base64 -d)
+export MINIO_PASSWORD=$(kubectl get secret --namespace $MINIO_NAMESPACE local-minio -o jsonpath="{.data.root-password}" | base64 -d)
 envsubst < resources/init.sql > resources/init-env.sql
 kubectl cp -n $DUCKDB_NAMESPACE resources/init-env.sql duckdb:/root
 
@@ -233,6 +266,57 @@ echo user: ${MINIO_USER}
 echo password: ${MINIO_PASSWORD}
 echo
 
-rm aws-creds minio-creds postgres-creds
+# Install Spark
+
+kubectl create namespace $SPARK_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+export POLARIS_ENDPOINT_INTERNAL=http://polaris.$POLARIS_NAMESPACE.svc.cluster.local:8181/api/catalog
+
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spark
+  namespace: $SPARK_NAMESPACE
+  labels:
+    app: spark
+spec:
+  containers:
+  - name: spark
+    image: apache/spark:3.5.4-scala2.12-java17-python3-ubuntu
+    command:
+      - sh
+      - -c
+      - "sleep infinity"
+    imagePullPolicy: IfNotPresent
+    env:
+    - name: MINIO_ENDPOINT
+      value: "http://local-minio.$MINIO_NAMESPACE.svc.cluster.local:9000"
+    - name: MINIO_USER
+      value: "${MINIO_USER}"
+    - name: MINIO_PASSWORD
+      value: "${MINIO_PASSWORD}"
+    - name: POLARIS_ENDPOINT
+      value: "${POLARIS_ENDPOINT_INTERNAL}"
+  restartPolicy: Always
+EOF
+
+kubectl wait --for=condition=ready pod/spark -n $SPARK_NAMESPACE --timeout=300s
+
+# Download Iceberg and S3 JARs directly into Spark's classpath so spark-submit
+# does not need Ivy/Maven at runtime
+MAVEN=https://repo1.maven.org/maven2
+kubectl exec -n $SPARK_NAMESPACE spark -- sh -c "
+  curl -fsSL -o /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.7.1.jar \
+    $MAVEN/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.7.1/iceberg-spark-runtime-3.5_2.12-1.7.1.jar && \
+  curl -fsSL -o /opt/spark/jars/hadoop-aws-3.3.4.jar \
+    $MAVEN/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar && \
+  curl -fsSL -o /opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
+    $MAVEN/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar
+"
+
+echo
+echo Spark pod is ready in namespace $SPARK_NAMESPACE
+echo
 
 popd
