@@ -17,8 +17,10 @@ export TOKEN=$(curl -s http://localhost:8181/api/catalog/v1/oauth/tokens \
 # Configure the DuckDB init sql
 export MINIO_ENDPOINT=local-minio.$MINIO_NAMESPACE.svc.cluster.local:9000
 export POLARIS_ENDPOINT=http://polaris.$POLARIS_NAMESPACE.svc.cluster.local:8181/api/catalog
-envsubst < resources/init.sql > resources/init-env.sql
-kubectl cp -n $DUCKDB_NAMESPACE resources/init-env.sql duckdb:/root
+export MINIO_USER=$(kubectl get secret --namespace $MINIO_NAMESPACE local-minio -o jsonpath="{.data.root-user}" | base64 -d)
+export MINIO_PASSWORD=$(kubectl get secret --namespace $MINIO_NAMESPACE local-minio -o jsonpath="{.data.root-password}" | base64 -d)
+envsubst < init.sql > init-env.sql
+kubectl cp -n $DUCKDB_NAMESPACE init-env.sql duckdb:/root
 
 # Check the number of arguments
 if [ $# -eq 0 ]; then
