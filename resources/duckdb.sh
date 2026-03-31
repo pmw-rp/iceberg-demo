@@ -5,7 +5,7 @@ pushd $SCRIPT_DIR
 
 # Refresh the token
 
-source ./config
+source ../config
 
 ## Get an access token
 export TOKEN=$(curl -s http://localhost:8181/api/catalog/v1/oauth/tokens \
@@ -22,11 +22,11 @@ kubectl cp -n $DUCKDB_NAMESPACE resources/init-env.sql duckdb:/root
 
 # Check the number of arguments
 if [ $# -eq 0 ]; then
-   kubectl exec -it -n $DUCKDB_NAMESPACE duckdb -- /root/.duckdb/cli/latest/duckdb -init /root/init-env.sql
+   kubectl exec -it -n $DUCKDB_NAMESPACE duckdb -- /root/.duckdb/cli/$DUCKDB_VERSION/duckdb -init /root/init-env.sql
 
 elif [ $# -eq 1 ]; then
     kubectl cp -n $DUCKDB_NAMESPACE $1 duckdb:/root
-    kubectl exec -it -n $DUCKDB_NAMESPACE duckdb -- /root/.duckdb/cli/latest/duckdb -init /root/init-env.sql -f /root/$(basename "$1")
+    kubectl exec -it -n $DUCKDB_NAMESPACE duckdb -- /root/.duckdb/cli/$DUCKDB_VERSION/duckdb -init /root/init-env.sql -f /root/$(basename "$1")
 
 else
     echo "Error: Expected 0 or 1 arguments, but got $#"

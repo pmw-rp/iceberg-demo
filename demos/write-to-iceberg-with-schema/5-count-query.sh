@@ -5,6 +5,6 @@ source ../../config
 
 # Perform a query to retrieve some data
 kubectl cp -n $DUCKDB_NAMESPACE count.sql duckdb:/root
-kubectl exec -it -n $DUCKDB_NAMESPACE duckdb -- /root/.duckdb/cli/latest/duckdb -init /root/init-env.sql -f /root/count.sql
+kubectl exec -it -n $DUCKDB_NAMESPACE duckdb -- /root/.duckdb/cli/$DUCKDB_VERSION/duckdb -init /root/init-env.sql -f /root/count.sql
 
 popd

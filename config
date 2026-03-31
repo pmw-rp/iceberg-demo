@@ -3,3 +3,5 @@ export POSTGRES_NAMESPACE=postgres
 export POLARIS_NAMESPACE=polaris
 export REDPANDA_NAMESPACE=redpanda
 export DUCKDB_NAMESPACE=duckdb
+export DUCKDB_VERSION=1.4.1
+export SPARK_NAMESPACE=spark
